@@ -1,3 +1,9 @@
-requests>=2.31.0
-pandas>=2.0.0
-numpy>=1.24.0
+# options-scalp-bot dependencies
+# Python 3.12
+
+# Official Webull OpenAPI SDK — handles auth, signing, and HTTP transport
+webull-openapi-python-sdk>=2.0.13
+
+# Discord webhook delivery
+requests>=2.32.0
+urllib3>=2.2.0
