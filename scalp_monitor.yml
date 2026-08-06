@@ -1,0 +1,93 @@
+# scalp_monitor.yml
+# ------------------
+# Polls the open option position every 60 seconds and fires TP/SL/time-
+# exit alerts (spec §2.3, §8).
+#
+# Trigger: workflow_dispatch — launched by scalp_scanner.yml only when a
+#          trade actually fires.  Never runs on its own schedule, so if
+#          no trade fires, no monitoring resources are consumed.
+#
+# Runtime: up to 6 hours (GitHub Actions job maximum).  The monitor
+#          exits by itself when a TP/SL/time-exit condition is met.
+#          The hard time-exit at 3:45pm ET is enforced in code, so the
+#          job will always terminate well within the 6-hour limit.
+#
+# State: reads data/active_trade.json (written by the scanner workflow)
+#        and commits data/trade_log.csv + cleared active_trade.json back
+#        to the repo after the trade exits.
+
+name: Scalp Monitor
+
+on:
+  workflow_dispatch:    # triggered by scalp_scanner.yml
+
+# Only one monitor should ever run at a time
+concurrency:
+  group: scalp-monitor
+  cancel-in-progress: false   # don't cancel a running monitor mid-trade
+
+jobs:
+  run-monitor:
+    name: Run Position Monitor
+    runs-on: ubuntu-latest
+    timeout-minutes: 360      # 6 hours — GitHub Actions maximum
+
+    permissions:
+      contents: write          # needed to commit trade_log.csv
+
+    env:
+      WEBULL_APP_ID:           ${{ secrets.WEBULL_APP_ID }}
+      WEBULL_APP_SECRET:       ${{ secrets.WEBULL_APP_SECRET }}
+      WEBULL_PAPER_ACCOUNT_ID: ${{ secrets.WEBULL_PAPER_ACCOUNT_ID }}
+      DISCORD_WEBHOOK_ALERTS:  ${{ secrets.DISCORD_WEBHOOK_ALERTS }}
+      DISCORD_WEBHOOK_LOG:     ${{ secrets.DISCORD_WEBHOOK_LOG }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Pull the latest commit so we get the active_trade.json just
+          # written by the scanner workflow
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify active trade exists
+        run: |
+          python -c "
+          import json, sys
+          try:
+              data = json.load(open('data/active_trade.json'))
+              if not data.get('ticker'):
+                  print('ERROR: active_trade.json is empty — no trade to monitor.')
+                  sys.exit(1)
+              print(f\"Monitoring: {data['ticker']} {data['direction']} \${data['strike']:.0f} | entry={data['entry_price']}\")
+          except FileNotFoundError:
+              print('ERROR: active_trade.json not found.')
+              sys.exit(1)
+          except json.JSONDecodeError as e:
+              print(f'ERROR: active_trade.json is invalid JSON: {e}')
+              sys.exit(1)
+          "
+
+      - name: Run position monitor
+        run: python -m monitor.position_monitor
+
+      # After the monitor exits (TP/SL/time), commit the updated log and
+      # the cleared active_trade.json back to the repo
+      - name: Commit trade log and clear state
+        if: always()      # run even if the monitor step fails
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/trade_log.csv data/active_trade.json
+          git commit -m "chore: record trade exit [skip ci]" || echo "Nothing new to commit"
+          git push || echo "Push failed — may need to pull first"

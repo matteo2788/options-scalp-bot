@@ -1,0 +1,102 @@
+# scalp_scanner.yml
+# ------------------
+# Runs the ticker picker, entry timer, direction engine, and strike
+# selector every weekday morning (spec §2.3).
+#
+# Trigger: 9:25am EST = 14:25 UTC (EST is UTC-5).
+#          During EDT (summer, UTC-4) adjust to 13:25 UTC — update the
+#          cron string below for daylight-saving transitions.
+#
+# This workflow runs for at most ~60 minutes (the maximum entry window
+# is 9:30–10:15am = 45 min plus startup time).  If a trade fires,
+# active_trade.json is committed back to the repo and scalp_monitor.yml
+# is triggered via workflow_dispatch.
+
+name: Scalp Scanner
+
+on:
+  # 14:25 UTC = 9:25am EST (UTC-5)
+  # Change to 13:25 UTC during EDT (UTC-4)
+  schedule:
+    - cron: "25 14 * * 1-5"
+
+  # Allow manual trigger for testing
+  workflow_dispatch:
+
+# Cancel any in-progress run if re-triggered (shouldn't happen in normal
+# operation but useful during debugging)
+concurrency:
+  group: scalp-scanner
+  cancel-in-progress: true
+
+jobs:
+  run-scanner:
+    name: Run Options Scalp Scanner
+    runs-on: ubuntu-latest
+    timeout-minutes: 90      # well past the 10:15am cutoff with buffer
+
+    permissions:
+      contents: write        # needed to push active_trade.json back to repo
+
+    env:
+      WEBULL_APP_ID:           ${{ secrets.WEBULL_APP_ID }}
+      WEBULL_APP_SECRET:       ${{ secrets.WEBULL_APP_SECRET }}
+      WEBULL_PAPER_ACCOUNT_ID: ${{ secrets.WEBULL_PAPER_ACCOUNT_ID }}
+      DISCORD_WEBHOOK_ALERTS:  ${{ secrets.DISCORD_WEBHOOK_ALERTS }}
+      DISCORD_WEBHOOK_LOG:     ${{ secrets.DISCORD_WEBHOOK_LOG }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        run: python -m scanner.main
+
+      # If a trade was entered, active_trade.json will have non-empty content.
+      # Commit it back so the monitor workflow can read it.
+      - name: Check if trade was entered
+        id: check_trade
+        run: |
+          if python -c "
+          import json, sys
+          try:
+              data = json.load(open('data/active_trade.json'))
+              sys.exit(0 if data.get('ticker') else 1)
+          except Exception:
+              sys.exit(1)
+          "; then
+            echo "trade_entered=true" >> $GITHUB_OUTPUT
+          else
+            echo "trade_entered=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit active_trade.json
+        if: steps.check_trade.outputs.trade_entered == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/active_trade.json
+          git commit -m "chore: write active trade state [skip ci]" || echo "Nothing to commit"
+          git push
+
+      - name: Trigger position monitor
+        if: steps.check_trade.outputs.trade_entered == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              workflow_id: 'scalp_monitor.yml',
+              ref: 'main',
+            });
+            console.log('scalp_monitor.yml triggered.');
