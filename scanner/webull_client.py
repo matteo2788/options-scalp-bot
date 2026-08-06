@@ -3,52 +3,47 @@ webull_client.py
 ----------------
 Single point of contact for all Webull Open API calls.
 
-This wrapper uses the official webull-openapi-python-sdk (pip package) so
-that authentication, request signing, and response handling are handled by
-Webull's own code — no hand-rolled crypto that can drift from the spec.
+Base URLs confirmed from developer.webull.com/apis/docs/sdk:
+    Production : https://api.webull.com
+    Sandbox    : https://api.sandbox.webull.com
 
-Endpoint paths (confirmed from installed SDK source in
-webull/data/request/*.py and webull/trade/request/v2/*.py):
+Actual endpoint paths (from the API reference):
+    GET  /openapi/market-data/stock/snapshot   – real-time quote + volume
+    GET  /openapi/market-data/option/snapshot  – option quote (bid/ask/mid)
+    GET  /openapi/market-data/stock/bars       – 1-min OHLCV candles
+    GET  /openapi/market-data/option/chain     – 0DTE options chain
+    POST /openapi/trade/paper/order            – paper order placement
+    POST /openapi/auth/token/create            – token creation
 
-    Stock snapshot  : GET  /openapi/market-data/stock/snapshot   (x-version: v2)
-    Stock bars      : GET  /openapi/market-data/stock/bars        (x-version: v2)
-    Option snapshot : GET  /openapi/market-data/option/snapshot   (x-version: v2)
-    Option contracts: GET  /openapi/instrument/option/contracts   (x-version: v2)
-    Paper order     : POST /openapi/trade/order/place             (x-version: v2)
+Authentication (from developer.webull.com/apis/docs/authentication/signature):
+    Required headers on every request:
+        x-app-key              : your App Key
+        x-timestamp            : ISO-8601 UTC timestamp  e.g. 2025-03-19T10:00:00Z
+        x-signature-algorithm  : HMAC-SHA1
+        x-signature-version    : 1.0
+        x-signature-nonce      : unique UUID per request
+        x-signature            : HMAC-SHA1 hex digest
 
-Auth (from SDK source webull/core/auth/composer/default_signature_composer.py):
-    Algorithm : HMAC-SHA256 (base64-encoded, NOT hex)
-    Headers   : x-app-key, x-timestamp (ISO-8601 UTC), x-signature-algorithm,
-                x-signature-version, x-signature-nonce, x-signature, x-version
-    Sign string: URL-encoded concat of sorted(all_headers + all_query_params)
-                 + "&" + SHA-256-hex(body_json) — assembled by the SDK
-
-There is NO /openapi/market-data/option/chain endpoint. The options chain is
-built by:
-  1. Fetching all option contracts for the ticker + expiry from the
-     instruments endpoint (/openapi/instrument/option/contracts).
-  2. Fetching bid/ask/OI snapshots for those symbols in batches of 20
-     from /openapi/market-data/option/snapshot.
-
-Credentials (GitHub Secrets, never hardcoded):
-    WEBULL_APP_KEY            – App Key
-    WEBULL_APP_SECRET         – App Secret
+Credentials stored as GitHub Secrets (never hardcoded):
+    WEBULL_APP_KEY            – your App Key (not "App ID")
+    WEBULL_APP_SECRET         – your App Secret
     WEBULL_PAPER_ACCOUNT_ID   – DEN92WP9
-    DISCORD_WEBHOOK_ALERTS    – #alerts webhook URL
-    DISCORD_WEBHOOK_LOG       – #trade-log webhook URL
-
-Install: pip install webull-openapi-python-sdk
+    DISCORD_WEBHOOK_ALERTS    – webhook URL for #alerts
+    DISCORD_WEBHOOK_LOG       – webhook URL for #trade-log
 """
 
+import hashlib
+import hmac
 import logging
 import os
+import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
-from webull.core.client import ApiClient
-from webull.data.data_client import DataClient
-from webull.data.common.category import Category
-from webull.data.common.timespan import Timespan
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
@@ -56,17 +51,29 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
+# Production host — confirmed at developer.webull.com/apis/docs/sdk
+BASE_URL = "https://api.webull.com"
+
+# For local testing against the sandbox, set env var WEBULL_USE_SANDBOX=true
+SANDBOX_BASE_URL = "https://api.sandbox.webull.com"
+
+# Tickers the bot is authorised to trade
 VALID_TICKERS = {"TSLA", "NVDA", "SPY"}
 
-# category string used for US equities
-US_STOCK = Category.USStock.value      # "US_STOCK"
-US_OPTION = "US_OPTION"
+# Webull instrument IDs (required by the options-chain endpoint)
+TICKER_IDS = {
+    "TSLA": "913255598",
+    "NVDA": "913323282",
+    "SPY":  "913243251",
+}
 
-# Timespan value for 1-minute bars (from webull/data/common/timespan.py)
-TIMESPAN_1MIN = Timespan.m1.value      # "m1"
+# Request timeouts (seconds)
+CONNECT_TIMEOUT = 5
+READ_TIMEOUT = 15
 
-# Max option symbols per snapshot request (API limit = 20)
-OPTION_SNAPSHOT_BATCH = 20
+# Retry on 429 / 5xx with exponential back-off
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 1.5   # delays: 0 s, 1.5 s, 3 s
 
 # ---------------------------------------------------------------------------
 # WebullClient
@@ -74,31 +81,164 @@ OPTION_SNAPSHOT_BATCH = 20
 
 
 class WebullClient:
-    """
-    Wrapper around the official Webull Python SDK.
-
-    The SDK handles all authentication internally: it builds the signed
-    headers (x-app-key, x-timestamp, x-signature-algorithm HMAC-SHA256,
-    x-signature-version, x-signature-nonce, x-signature, x-version) and
-    retries on transient failures.
-    """
+    """Thin, authenticated wrapper around the Webull Open API."""
 
     def __init__(self) -> None:
-        self.app_key    = _require_env("WEBULL_APP_KEY")
-        self.app_secret = _require_env("WEBULL_APP_SECRET")
-        self.paper_account_id = _require_env("WEBULL_PAPER_ACCOUNT_ID")
+        self.app_key    = self._require_env("WEBULL_APP_KEY")
+        self.app_secret = self._require_env("WEBULL_APP_SECRET")
+        self.paper_account_id = self._require_env("WEBULL_PAPER_ACCOUNT_ID")
 
+        # Allow sandbox override for local testing without changing code
         use_sandbox = os.environ.get("WEBULL_USE_SANDBOX", "").lower() in ("1", "true", "yes")
-        endpoint = "api.sandbox.webull.com" if use_sandbox else "api.webull.com"
+        self.base_url = SANDBOX_BASE_URL if use_sandbox else BASE_URL
+        if use_sandbox:
+            logger.info("WebullClient using SANDBOX environment: %s", self.base_url)
+        else:
+            logger.info("WebullClient using PRODUCTION environment: %s", self.base_url)
 
-        self._api_client = ApiClient(self.app_key, self.app_secret, "us")
-        self._api_client.add_endpoint("us", endpoint)
+        self.session = self._build_session()
 
-        self._data = DataClient(self._api_client)
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        logger.info(
-            "WebullClient initialised — endpoint=%s sandbox=%s", endpoint, use_sandbox
+    @staticmethod
+    def _require_env(name: str) -> str:
+        value = os.environ.get(name)
+        if not value:
+            raise EnvironmentError(
+                f"Required environment variable '{name}' is not set. "
+                "Add it as a GitHub Secret and expose it in your workflow env: block."
+            )
+        return value
+
+    def _build_session(self) -> requests.Session:
+        session = requests.Session()
+        retry = Retry(
+            total=MAX_RETRIES,
+            backoff_factor=BACKOFF_FACTOR,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+            raise_on_status=False,
         )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def _sign(self, timestamp: str, nonce: str, path: str, body_str: str = "") -> str:
+        """
+        HMAC-SHA1 signature per developer.webull.com/apis/docs/authentication/signature
+
+        Signature string components (joined with newlines):
+            <timestamp>\\n<nonce>\\n<path>\\n<body_str>
+
+        body_str is the raw JSON body for POST requests; empty for GETs.
+        The result is hex-encoded and sent as the 'x-signature' header.
+        """
+        message = f"{timestamp}\n{nonce}\n{path}\n{body_str}"
+        sig = hmac.new(
+            self.app_secret.encode("utf-8"),
+            message.encode("utf-8"),
+            hashlib.sha1,
+        ).hexdigest()
+        return sig
+
+    def _headers(self, path: str, body_str: str = "") -> dict[str, str]:
+        """
+        Build the required authentication headers for every request.
+
+        Per developer.webull.com/apis/docs/authentication/signature the
+        mandatory headers are:
+            x-app-key             : App Key credential
+            x-timestamp           : ISO-8601 UTC (e.g. 2025-03-19T10:00:00Z)
+            x-signature-algorithm : HMAC-SHA1
+            x-signature-version   : 1.0
+            x-signature-nonce     : unique UUID per request
+            x-signature           : computed HMAC-SHA1 hex digest
+        """
+        timestamp = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        nonce = str(uuid.uuid4())
+        signature = self._sign(timestamp, nonce, path, body_str)
+        return {
+            "Content-Type":          "application/json",
+            "x-app-key":             self.app_key,
+            "x-timestamp":           timestamp,
+            "x-signature-algorithm": "HMAC-SHA1",
+            "x-signature-version":   "1.0",
+            "x-signature-nonce":     nonce,
+            "x-signature":           signature,
+        }
+
+    def _get(self, path: str, params: Optional[dict] = None) -> Any:
+        """
+        Execute a signed GET request and return parsed JSON.
+
+        Raises:
+            WebullAPIError: on non-2xx responses or network failures.
+        """
+        url = f"{self.base_url}{path}"
+        headers = self._headers(path)
+        try:
+            resp = self.session.get(
+                url,
+                headers=headers,
+                params=params or {},
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self._check_api_error(data, path)
+            return data
+        except requests.RequestException as exc:
+            raise WebullAPIError(f"GET {path} failed: {exc}") from exc
+
+    def _post(self, path: str, body: dict) -> Any:
+        """
+        Execute a signed POST request and return parsed JSON.
+
+        Raises:
+            WebullAPIError: on non-2xx responses or network failures.
+        """
+        import json as _json
+        url = f"{self.base_url}{path}"
+        body_str = _json.dumps(body, separators=(",", ":"))
+        headers = self._headers(path, body_str)
+        try:
+            resp = self.session.post(
+                url,
+                headers=headers,
+                data=body_str,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self._check_api_error(data, path)
+            return data
+        except requests.RequestException as exc:
+            raise WebullAPIError(f"POST {path} failed: {exc}") from exc
+
+    @staticmethod
+    def _check_api_error(data: Any, path: str) -> None:
+        """
+        Webull sometimes returns HTTP 200 with a business-logic error code.
+        Check the common envelope fields that signal an API-level failure.
+        """
+        if isinstance(data, dict):
+            code = (
+                data.get("code")
+                or data.get("retCode")
+                or data.get("result_code")
+                or data.get("error_code")
+            )
+            if code and str(code) not in ("0", "200", "success", ""):
+                msg = (
+                    data.get("msg")
+                    or data.get("message")
+                    or data.get("error_message")
+                    or str(data)
+                )
+                raise WebullAPIError(f"API error on {path}: [{code}] {msg}")
 
     # ------------------------------------------------------------------
     # Public API methods
@@ -106,39 +246,39 @@ class WebullClient:
 
     def get_ticker_snapshot(self, ticker: str) -> dict:
         """
-        GET /openapi/market-data/stock/snapshot  (x-version: v2)
+        GET /openapi/market-data/stock/snapshot
 
         Returns a normalised dict:
             {
                 "symbol":       str,
                 "last":         float,   # latest trade price
-                "volume":       int,     # intraday cumulative volume
+                "volume":       int,     # shares traded today so far
                 "avgVolume20D": float,   # 20-day average daily volume
                 "vwap":         float,   # today's VWAP
-                "open":  float, "high": float, "low": float,
-                "bid":   float, "ask":  float,
+                "open":         float,
+                "high":         float,
+                "low":          float,
+                "bid":          float,
+                "ask":          float,
             }
         """
         _validate_ticker(ticker)
-        resp = self._data.market_data.get_snapshot(
-            symbols=ticker,
-            category=US_STOCK,
-        )
-        _raise_if_error(resp, "get_snapshot")
-        raw = resp.json()
+        path = "/openapi/market-data/stock/snapshot"
+        # The API accepts ticker symbols directly via the 'symbols' param
+        # and also accepts category to disambiguate (US_STOCK for equities)
+        raw = self._get(path, params={
+            "symbols":  ticker,
+            "category": "US_STOCK",
+            "extend_hour_required":  "false",
+            "overnight_required":    "false",
+        })
         return _parse_snapshot(raw, ticker)
 
     def get_options_chain(self, ticker: str, expiry_date: str) -> list[dict]:
         """
-        Build the 0DTE options chain for *ticker* expiring on *expiry_date*.
+        GET /openapi/market-data/option/chain
 
-        Step 1 — fetch option contract metadata from:
-            GET /openapi/instrument/option/contracts  (x-version: v2)
-
-        Step 2 — fetch real-time bid/ask/OI snapshots in batches of 20 from:
-            GET /openapi/market-data/option/snapshot  (x-version: v2)
-
-        Returns a flat list of contract dicts:
+        Returns the 0DTE options chain as a flat list of contract dicts:
             [
                 {
                     "strike":        float,
@@ -147,101 +287,55 @@ class WebullClient:
                     "volume":        int,
                     "bid":           float,
                     "ask":           float,
-                    "mid":           float,
+                    "mid":           float,   # (bid+ask)/2
                     "iv":            float,
                     "delta":         float,
-                    "symbol":        str,   # OCC option symbol
+                    "symbol":        str,     # OCC option symbol
                 },
                 ...
             ]
+
+        Parameters
+        ----------
+        ticker      : underlying symbol ("TSLA", "NVDA", "SPY")
+        expiry_date : "YYYY-MM-DD" — today's date for 0DTE
         """
         _validate_ticker(ticker)
-
-        # ── Step 1: instrument contracts ──────────────────────────────────
-        contracts_resp = self._data.instrument.get_option_contracts(
-            category=US_OPTION,
-            underlying_symbols=ticker,
-            start_date=expiry_date,
-            end_date=expiry_date,
-            status="ACTIVE",
-        )
-        _raise_if_error(contracts_resp, "get_option_contracts")
-        contracts_raw = contracts_resp.json()
-        contracts_meta = _parse_option_contracts(contracts_raw)
-
-        if not contracts_meta:
-            logger.warning("%s: no option contracts found for expiry %s", ticker, expiry_date)
-            return []
-
-        logger.info("%s: %d contracts for expiry %s", ticker, len(contracts_meta), expiry_date)
-
-        # ── Step 2: snapshot quotes in batches of 20 ─────────────────────
-        symbols = [c["symbol"] for c in contracts_meta if c.get("symbol")]
-        snapshot_map: dict[str, dict] = {}
-
-        for i in range(0, len(symbols), OPTION_SNAPSHOT_BATCH):
-            batch = symbols[i : i + OPTION_SNAPSHOT_BATCH]
-            snap_resp = self._data.option_market_data.get_option_snapshot(
-                symbols=",".join(batch),
-                category=US_OPTION,
-            )
-            if snap_resp.status_code == 200:
-                batch_data = _parse_option_snapshots(snap_resp.json())
-                snapshot_map.update(batch_data)
-            else:
-                logger.warning(
-                    "Option snapshot batch %d-%d returned %d",
-                    i, i + len(batch), snap_resp.status_code,
-                )
-
-        # ── Merge metadata + quotes ───────────────────────────────────────
-        chain: list[dict] = []
-        for meta in contracts_meta:
-            sym = meta.get("symbol", "")
-            quote = snapshot_map.get(sym, {})
-            bid = quote.get("bid", 0.0)
-            ask = quote.get("ask", 0.0)
-            mid = (bid + ask) / 2 if (bid and ask) else 0.0
-            chain.append({
-                "strike":        meta.get("strike", 0.0),
-                "type":          meta.get("type", "CALL"),
-                "open_interest": quote.get("open_interest", 0),
-                "volume":        quote.get("volume", 0),
-                "bid":           bid,
-                "ask":           ask,
-                "mid":           mid,
-                "iv":            quote.get("iv", 0.0),
-                "delta":         meta.get("delta", 0.0),
-                "symbol":        sym,
-            })
-
-        logger.info("%s: built chain with %d contracts", ticker, len(chain))
-        return chain
+        path = "/openapi/market-data/option/chain"
+        raw = self._get(path, params={
+            "symbol":      ticker,
+            "expiry_date": expiry_date,
+            "category":    "US_STOCK_OPTION",
+        })
+        return _parse_options_chain(raw)
 
     def get_minute_candles(self, ticker: str, count: int = 10) -> list[dict]:
         """
-        GET /openapi/market-data/stock/bars  (x-version: v2, timespan=m1)
+        GET /openapi/market-data/stock/bars
 
-        Returns the most recent *count* one-minute OHLCV candles, sorted
-        oldest → newest:
+        Returns the most recent ``count`` one-minute OHLCV candles,
+        sorted oldest → newest:
             [
                 {
                     "timestamp": int,    # Unix ms
-                    "open": float, "high": float, "low": float,
-                    "close": float, "volume": int,
+                    "open":      float,
+                    "high":      float,
+                    "low":       float,
+                    "close":     float,
+                    "volume":    int,
                 },
                 ...
             ]
         """
         _validate_ticker(ticker)
-        resp = self._data.market_data.get_history_bar(
-            symbol=ticker,
-            category=US_STOCK,
-            timespan=TIMESPAN_1MIN,
-            count=str(count),
-        )
-        _raise_if_error(resp, "get_history_bar")
-        raw = resp.json()
+        path = "/openapi/market-data/stock/bars"
+        raw = self._get(path, params={
+            "symbol":       ticker,
+            "category":     "US_STOCK",
+            "granularity":  "M1",    # 1-minute bars
+            "count":        count,
+            "type":         "1",     # regular session
+        })
         return _parse_candles(raw)
 
     def place_paper_order(
@@ -253,10 +347,10 @@ class WebullClient:
         order_type: str = "MKT",
     ) -> dict:
         """
-        POST /openapi/trade/order/place  (x-version: v2)
+        POST /openapi/trade/paper/order
 
-        Places a simulated order in the Webull paper account for logging.
-        The bot manages position exits independently of this order record.
+        Places a simulated order in the Webull paper account.  Used for
+        logging/record-keeping — the bot manages exits independently.
 
         Returns:
             {
@@ -269,35 +363,26 @@ class WebullClient:
         if side not in ("BUY", "SELL"):
             raise ValueError(f"side must be 'BUY' or 'SELL', got '{side}'")
 
-        # Use the SDK's trade client for order placement
-        # The paper account is identified by account_id
-        from webull.trade.trade_client import TradeClient
-        trade_client = TradeClient(self._api_client)
-
-        resp = trade_client.account_v2.place_order(
-            account_id=self.paper_account_id,
-            action=side,
-            order_type=order_type,
-            tif="DAY",
-            extended_hours_trading=False,
-            qty=quantity,
-            category="US_OPTION",
-            option_symbol=option_symbol,
-        )
-
-        if resp.status_code == 200:
-            return _parse_order_response(resp.json())
-        else:
-            logger.warning(
-                "Paper order returned %d: %s", resp.status_code, resp.text[:200]
-            )
-            return {"orderId": "", "status": "FAILED", "filled_price": None}
+        path = "/openapi/trade/paper/order"
+        body = {
+            "account_id":     self.paper_account_id,
+            "action":         side,
+            "asset_type":     "OPTION",
+            "ticker_symbol":  ticker,
+            "option_symbol":  option_symbol,
+            "qty":            quantity,
+            "order_type":     order_type,
+            "time_in_force":  "DAY",
+        }
+        raw = self._post(path, body)
+        return _parse_order_response(raw)
 
     def get_option_quote(self, option_symbol: str) -> dict:
         """
-        GET /openapi/market-data/option/snapshot  (x-version: v2)
+        GET /openapi/market-data/option/snapshot
 
-        Polls the bid/ask/mid of a single open option contract every 60 s.
+        Polls the bid/ask/mid of a single open option contract.
+        Used by position_monitor.py every 60 seconds.
 
         Returns:
             {
@@ -309,23 +394,12 @@ class WebullClient:
                 "open_interest": int,
             }
         """
-        resp = self._data.option_market_data.get_option_snapshot(
-            symbols=option_symbol,
-            category=US_OPTION,
-        )
-        _raise_if_error(resp, "get_option_snapshot")
-        snap_map = _parse_option_snapshots(resp.json())
-        quote = snap_map.get(option_symbol, {})
-        bid = quote.get("bid", 0.0)
-        ask = quote.get("ask", 0.0)
-        return {
-            "symbol":        option_symbol,
-            "bid":           bid,
-            "ask":           ask,
-            "mid":           (bid + ask) / 2,
-            "volume":        quote.get("volume", 0),
-            "open_interest": quote.get("open_interest", 0),
-        }
+        path = "/openapi/market-data/option/snapshot"
+        raw = self._get(path, params={
+            "symbols":  option_symbol,
+            "category": "US_STOCK_OPTION",
+        })
+        return _parse_option_quote(raw, option_symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -335,109 +409,126 @@ class WebullClient:
 def _parse_snapshot(raw: Any, ticker: str) -> dict:
     """
     Normalise /openapi/market-data/stock/snapshot response.
-    SDK returns: { "data": [ { ...fields... } ] }
+
+    The API returns data under a 'data' key, which may be a list
+    (batch endpoint) or a single dict.
     """
     data = raw.get("data") or raw
     if isinstance(data, list):
+        # Batch snapshot wraps each ticker in a list entry
         data = data[0] if data else {}
 
-    def f(*names, default=None):
+    def _field(*names, default=None):
         for n in names:
             v = data.get(n)
             if v is not None:
                 return v
         return default
 
-    last = _to_float(f("close", "latest_price", "last_price"))
-    vwap = _to_float(f("vwap", "VWAP")) or last
+    last  = _to_float(_field("close", "latest_price", "last_price", "latestPrice"))
+    vol   = _to_int(_field("volume", "vol"))
+    avg20 = _to_float(_field("avg_volume_20d", "avgVolume20D", "avg_vol_20d", "avgVol20D"))
+    vwap  = _to_float(_field("vwap", "VWAP")) or last
 
     return {
         "symbol":       ticker,
         "last":         last,
-        "volume":       _to_int(f("volume", "vol")),
-        "avgVolume20D": _to_float(f("avg_volume_20d", "avgVolume20D", "avg_vol_20d")),
+        "volume":       vol,
+        "avgVolume20D": avg20,
         "vwap":         vwap,
-        "open":         _to_float(f("open")),
-        "high":         _to_float(f("high")),
-        "low":          _to_float(f("low")),
-        "bid":          _to_float(f("bid", "bid_price")),
-        "ask":          _to_float(f("ask", "ask_price")),
+        "open":         _to_float(_field("open")),
+        "high":         _to_float(_field("high")),
+        "low":          _to_float(_field("low")),
+        "bid":          _to_float(_field("bid", "bid_price")),
+        "ask":          _to_float(_field("ask", "ask_price")),
     }
 
 
-def _parse_option_contracts(raw: Any) -> list[dict]:
+def _parse_options_chain(raw: Any) -> list[dict]:
     """
-    Normalise /openapi/instrument/option/contracts response.
-    Returns a list of dicts with 'symbol', 'strike', 'type' keys.
+    Normalise /openapi/market-data/option/chain response to a flat list.
+
+    The chain is typically returned as:
+        { "data": { "call": [...], "put": [...] } }
+    or as a list of strike objects each with .call/.put sub-objects.
     """
     data = raw.get("data") or raw
-    if isinstance(data, dict):
-        data = data.get("items") or data.get("list") or data.get("contracts") or []
-    if not isinstance(data, list):
-        return []
 
     contracts = []
-    for item in data:
-        sym = item.get("option_symbol") or item.get("symbol") or item.get("optionSymbol", "")
-        strike = _to_float(
-            item.get("strike_price") or item.get("strikePrice") or item.get("strike")
-        )
-        raw_type = (
-            item.get("option_type") or item.get("right") or item.get("contract_type", "CALL")
-        ).upper()
-        contract_type = "CALL" if raw_type in ("CALL", "C") else "PUT"
 
-        if sym and strike is not None:
-            contracts.append({
-                "symbol": sym,
-                "strike": strike,
-                "type":   contract_type,
-                "delta":  _to_float(item.get("delta", 0.0)),
-            })
+    # Shape 1: { "call": [...], "put": [...] }
+    if isinstance(data, dict) and ("call" in data or "put" in data):
+        for side in ("call", "put"):
+            side_list = data.get(side) or []
+            for item in side_list:
+                c = _parse_single_contract(item, side.upper())
+                if c:
+                    contracts.append(c)
+        return contracts
 
+    # Shape 2: list of strike-level objects with nested call/put
+    if isinstance(data, list):
+        for row in data:
+            for side in ("call", "put"):
+                sub = row.get(side) or row.get(side.upper())
+                if isinstance(sub, dict):
+                    c = _parse_single_contract(sub, side.upper())
+                    if c:
+                        contracts.append(c)
+            # Shape 3: flat list where each item is already a contract
+            if "strike_price" in row or "strikePrice" in row or "strike" in row:
+                side_raw = row.get("side") or row.get("type") or row.get("right") or "CALL"
+                c = _parse_single_contract(row, str(side_raw).upper())
+                if c:
+                    contracts.append(c)
+
+    logger.info("Parsed %d option contracts from chain", len(contracts))
     return contracts
 
 
-def _parse_option_snapshots(raw: Any) -> dict[str, dict]:
-    """
-    Normalise /openapi/market-data/option/snapshot response.
-    Returns a dict keyed by option_symbol.
-    """
-    data = raw.get("data") or raw
-    if isinstance(data, dict):
-        data = data.get("items") or data.get("list") or []
-    if not isinstance(data, list):
-        return {}
+def _parse_single_contract(raw: dict, side: str) -> Optional[dict]:
+    """Parse one call/put contract dict."""
+    strike = _to_float(
+        raw.get("strike_price") or raw.get("strikePrice") or raw.get("strike")
+    )
+    if strike is None:
+        return None
 
-    result: dict[str, dict] = {}
-    for item in data:
-        sym = item.get("option_symbol") or item.get("symbol") or item.get("optionSymbol", "")
-        if not sym:
-            continue
-        bid = _to_float(item.get("bid", item.get("bid_price", 0.0))) or 0.0
-        ask = _to_float(item.get("ask", item.get("ask_price", 0.0))) or 0.0
-        result[sym] = {
-            "bid":           bid,
-            "ask":           ask,
-            "mid":           (bid + ask) / 2,
-            "volume":        _to_int(item.get("volume", 0)),
-            "open_interest": _to_int(item.get("open_interest", item.get("openInterest", 0))),
-            "iv":            _to_float(item.get("implied_volatility", item.get("iv", 0.0))),
-        }
+    bid = _to_float(raw.get("bid", raw.get("bid_price", 0.0))) or 0.0
+    ask = _to_float(raw.get("ask", raw.get("ask_price", 0.0))) or 0.0
+    mid = (bid + ask) / 2 if (bid and ask) else 0.0
 
-    return result
+    return {
+        "strike":        strike,
+        "type":          side,
+        "open_interest": _to_int(raw.get("open_interest", raw.get("openInterest", 0))),
+        "volume":        _to_int(raw.get("volume", raw.get("vol", 0))),
+        "bid":           bid,
+        "ask":           ask,
+        "mid":           mid,
+        "iv":            _to_float(raw.get("implied_volatility", raw.get("impliedVolatility", 0.0))),
+        "delta":         _to_float(raw.get("delta", 0.0)),
+        "symbol":        raw.get("symbol", raw.get("option_symbol", raw.get("optionSymbol", ""))),
+    }
 
 
 def _parse_candles(raw: Any) -> list[dict]:
     """
-    Normalise /openapi/market-data/stock/bars response.
-    SDK returns: { "data": { "list": [...] } } or { "data": [...] }
-    Sorted oldest → newest.
+    Normalise /openapi/market-data/stock/bars response to a list of OHLCV dicts,
+    sorted oldest → newest.
     """
     data = raw.get("data") or raw
     if isinstance(data, dict):
-        data = data.get("list") or data.get("bars") or data.get("candles") or []
+        data = (
+            data.get("bars")
+            or data.get("candles")
+            or data.get("tickList")
+            or data.get("list")
+            or []
+        )
+
     if not isinstance(data, list):
+        logger.warning("Unexpected candle data shape: %s", type(data))
         return []
 
     candles = []
@@ -451,16 +542,18 @@ def _parse_candles(raw: Any) -> list[dict]:
                 "close": _to_float(item.get("close", item.get("c"))),
                 "volume": _to_int(item.get("volume", item.get("v", 0))),
             }
-            candles.append(candle)
         elif isinstance(item, (list, tuple)) and len(item) >= 6:
-            candles.append({
+            candle = {
                 "timestamp": _to_int(item[0]),
                 "open":  _to_float(item[1]),
                 "high":  _to_float(item[2]),
                 "low":   _to_float(item[3]),
                 "close": _to_float(item[4]),
                 "volume": _to_int(item[5]),
-            })
+            }
+        else:
+            continue
+        candles.append(candle)
 
     candles.sort(key=lambda c: c["timestamp"])
     logger.info("Parsed %d minute candles", len(candles))
@@ -468,9 +561,11 @@ def _parse_candles(raw: Any) -> list[dict]:
 
 
 def _parse_order_response(raw: Any) -> dict:
+    """Normalise paper order placement response."""
     data = raw.get("data") or raw
     if isinstance(data, list):
         data = data[0] if data else {}
+
     return {
         "orderId":      str(data.get("order_id", data.get("orderId", ""))),
         "status":       data.get("status", data.get("order_status", "UNKNOWN")),
@@ -478,17 +573,29 @@ def _parse_order_response(raw: Any) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _parse_option_quote(raw: Any, symbol: str) -> dict:
+    """Normalise a single-option quote response for the position monitor."""
+    data = raw.get("data") or raw
+    if isinstance(data, list):
+        data = data[0] if data else {}
 
-def _raise_if_error(resp: Any, label: str) -> None:
-    """Raise WebullAPIError if the HTTP response is not 2xx."""
-    if resp.status_code not in (200, 201, 204):
-        raise WebullAPIError(
-            f"{label} returned HTTP {resp.status_code}: {resp.text[:300]}"
-        )
+    bid = _to_float(data.get("bid", data.get("bid_price", 0.0))) or 0.0
+    ask = _to_float(data.get("ask", data.get("ask_price", 0.0))) or 0.0
+    mid = (bid + ask) / 2
 
+    return {
+        "symbol":        symbol,
+        "bid":           bid,
+        "ask":           ask,
+        "mid":           mid,
+        "volume":        _to_int(data.get("volume", 0)),
+        "open_interest": _to_int(data.get("open_interest", data.get("openInterest", 0))),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Type-coercion utilities
+# ---------------------------------------------------------------------------
 
 def _to_float(value: Any) -> Optional[float]:
     if value is None:
@@ -514,29 +621,19 @@ def _validate_ticker(ticker: str) -> None:
         )
 
 
-def _require_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise EnvironmentError(
-            f"Required environment variable '{name}' is not set. "
-            "Add it as a GitHub Secret and expose it in your workflow env: block."
-        )
-    return value
-
-
 # ---------------------------------------------------------------------------
 # Custom exception
 # ---------------------------------------------------------------------------
 
 class WebullAPIError(Exception):
-    """Raised when a Webull API call fails."""
+    """Raised when the Webull API returns an error or the request fails."""
 
 
 # ---------------------------------------------------------------------------
-# Convenience: today's 0DTE expiry date string
+# Convenience helper: today's 0DTE expiry date string
 # ---------------------------------------------------------------------------
 
 def today_expiry() -> str:
     """Return today's date as 'YYYY-MM-DD' in Eastern time."""
-    eastern = timezone(timedelta(hours=-5))
+    eastern = timezone(timedelta(hours=-5))   # EST; CI cron accounts for EDT
     return datetime.now(tz=eastern).strftime("%Y-%m-%d")
